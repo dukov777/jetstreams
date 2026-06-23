@@ -8,9 +8,10 @@ Setup:
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import nats
 from nats.errors import Error as NatsError
+from nats.js.api import ConsumerConfig, DeliverPolicy
 
 
 # ============================================================================
@@ -38,12 +39,12 @@ async def example_1_create_stream_and_publish():
     for i in range(5):
         msg = {
             "id": i,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": "info",
             "message": f"Log entry {i}",
         }
         ack = await js.publish("logs.app", json.dumps(msg).encode())
-        print(f"Published: seq={ack.metadata.sequence.stream}")
+        print(f"Published: seq={ack.seq}")
     
     await nc.close()
 
@@ -58,21 +59,21 @@ async def example_2_pull_consumer():
     """
     nc = await nats.connect("nats://localhost:4222")
     js = nc.jetstream()
-    
-    # Create or get a consumer
+
+    # Create (or bind to) a durable pull consumer on the stream
     consumer = "pull_consumer_1"
+    sub = await js.pull_subscribe("logs.app", durable=consumer)
+
+    # Pull up to 10 messages with a 1-second timeout
     try:
-        await js.add_consumer("logs", durable_name=consumer)
-    except:
-        pass  # Consumer exists
-    
-    # Pull 10 messages with 1-second timeout
-    messages = await js.fetch(consumer, batch=10, timeout=1)
-    
+        messages = await sub.fetch(batch=10, timeout=1)
+    except nats.errors.TimeoutError:
+        messages = []
+
     for msg in messages:
         print(f"Pulled: {msg.metadata.sequence.stream} - {msg.data.decode()}")
         await msg.ack()  # Acknowledge, mark as processed
-    
+
     await nc.close()
 
 
@@ -86,17 +87,14 @@ async def consumer_worker(name: str, consumer_name: str):
     """
     nc = await nats.connect("nats://localhost:4222")
     js = nc.jetstream()
-    
+
     # Create consumer (durable name ensures cursor is persisted)
-    try:
-        await js.add_consumer("logs", durable_name=consumer_name)
-    except:
-        pass
-    
+    sub = await js.pull_subscribe("logs.app", durable=consumer_name)
+
     # Fetch and process indefinitely (like a daemon)
     while True:
         try:
-            messages = await js.fetch(consumer_name, batch=5, timeout=2)
+            messages = await sub.fetch(batch=5, timeout=2)
             for msg in messages:
                 data = json.loads(msg.data.decode())
                 print(f"[{name}] Processing: {data['id']} - {data['message']}")
@@ -178,17 +176,16 @@ async def example_5_replay():
     
     # Create consumer starting from sequence 3
     consumer = "replay_consumer"
+    config = ConsumerConfig(
+        deliver_policy=DeliverPolicy.BY_START_SEQUENCE,
+        opt_start_seq=3,  # Start from message 3
+    )
+    sub = await js.pull_subscribe("logs.app", durable=consumer, config=config)
+
     try:
-        await js.add_consumer(
-            "logs",
-            durable_name=consumer,
-            deliver_policy="by_start_sequence",
-            opt_start_seq=3,  # Start from message 3
-        )
-    except:
-        pass
-    
-    messages = await js.fetch(consumer, batch=10, timeout=2)
+        messages = await sub.fetch(batch=10, timeout=2)
+    except nats.errors.TimeoutError:
+        messages = []
     print(f"\nReplaying from sequence 3:")
     for msg in messages:
         seq = msg.metadata.sequence.stream
@@ -217,18 +214,14 @@ async def example_6_inspect():
     print(f"  Bytes: {stream_info.state.bytes}")
     
     # List all consumers for this stream
-    consumers = await js.consumers_names("logs")
-    print(f"\n  Consumers: {consumers}")
-    
-    # Get consumer info
-    for consumer_name in consumers:
-        try:
-            consumer_info = await js.consumer_info("logs", consumer_name)
-            pending = consumer_info.num_pending
-            acked = consumer_info.num_ack_pending
-            print(f"    {consumer_name}: pending={pending}, ack_pending={acked}")
-        except:
-            pass
+    consumers = await js.consumers_info("logs")
+    print(f"\n  Consumers: {[c.name for c in consumers]}")
+
+    # Report per-consumer state
+    for consumer_info in consumers:
+        pending = consumer_info.num_pending
+        acked = consumer_info.num_ack_pending
+        print(f"    {consumer_info.name}: pending={pending}, ack_pending={acked}")
     
     await nc.close()
 
