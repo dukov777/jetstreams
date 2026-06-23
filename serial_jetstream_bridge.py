@@ -17,6 +17,7 @@ import sys
 import logging
 from typing import Optional
 
+import serial
 import serial_asyncio
 import nats
 from nats.errors import TimeoutError as NatsTimeoutError
@@ -53,19 +54,65 @@ class SerialJetStreamBridge:
         self.nc: Optional[nats.NATS] = None
         self.js = None
         self._running = False
+
+        # Set True only while the serial port is open and healthy. The reader
+        # task owns reconnection; the writer checks this flag before touching
+        # the port so it never writes into a half-dead transport.
+        self._serial_connected = False
+        # Backoff ceiling for serial (re)connect attempts, in seconds.
+        self._reconnect_max_delay = 10.0
         
     async def connect_serial(self) -> None:
-        """Open serial port for async I/O."""
-        try:
-            self.serial_reader, self.serial_writer = await serial_asyncio.open_serial_connection(
-                url=self.port,
-                baudrate=self.baudrate,
-                timeout=1.0
-            )
-            logger.info(f"Connected to serial port {self.port} @ {self.baudrate} baud")
-        except Exception as e:
-            logger.error(f"Failed to open serial port {self.port}: {e}")
-            raise
+        """
+        Open the serial port for async I/O, retrying until it succeeds.
+
+        On Windows a USB serial adapter that is unplugged/reset throws
+        SerialException (e.g. 'ClearCommError failed'); the same retry loop
+        that handles the initial open also covers the case where the device
+        is not plugged in yet at startup.
+        """
+        delay = 1.0
+        while self._running:
+            try:
+                self.serial_reader, self.serial_writer = await serial_asyncio.open_serial_connection(
+                    url=self.port,
+                    baudrate=self.baudrate,
+                    timeout=1.0
+                )
+                self._serial_connected = True
+                logger.info(f"Connected to serial port {self.port} @ {self.baudrate} baud")
+                return
+            except (serial.SerialException, OSError) as e:
+                logger.warning(
+                    f"Failed to open serial port {self.port}: {e}; "
+                    f"retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._reconnect_max_delay)
+
+    async def _close_serial(self) -> None:
+        """
+        Close the current serial transport, swallowing errors raised by an
+        already-dead transport (the offending in_waiting/ClearCommError poll
+        fires again during close on Windows).
+        """
+        self._serial_connected = False
+        if self.serial_writer is not None:
+            try:
+                self.serial_writer.close()
+                await self.serial_writer.wait_closed()
+            except (serial.SerialException, OSError) as e:
+                logger.debug(f"Ignoring error while closing dead serial port: {e}")
+            finally:
+                self.serial_writer = None
+                self.serial_reader = None
+
+    async def _reconnect_serial(self) -> None:
+        """Tear down the broken serial connection and re-open it."""
+        logger.warning(f"Serial port {self.port} lost; attempting to reconnect")
+        await self._close_serial()
+        await self.connect_serial()
+        logger.info(f"Reconnected to serial port {self.port}")
     
     async def connect_nats(self) -> None:
         """Connect to NATS and set up JetStream streams."""
@@ -116,11 +163,19 @@ class SerialJetStreamBridge:
                 except asyncio.TimeoutError:
                     # No complete line yet, just continue
                     continue
+                except (serial.SerialException, OSError) as e:
+                    # Device unplugged/reset (e.g. Windows ClearCommError).
+                    # Reconnect instead of crashing the whole bridge.
+                    logger.error(f"Serial read error: {e}")
+                    await self._reconnect_serial()
+                    continue
 
                 if not line:
-                    # EOF on serial (port closed/unplugged)
-                    logger.warning("Serial reader got EOF, stopping")
-                    break
+                    # EOF on serial (port closed/unplugged) — treat as a
+                    # dropped connection and try to bring it back.
+                    logger.warning("Serial reader got EOF; reconnecting")
+                    await self._reconnect_serial()
+                    continue
 
                 # readline() includes the trailing '\n' (if present);
                 # strip it before publishing, the wire framing is NATS messages now.
@@ -144,13 +199,23 @@ class SerialJetStreamBridge:
         logger.info(f"Starting serial writer (subscribing to '{self.rx_subject}')")
         try:
             async def process_message(msg):
+                # Don't write while the port is down/reconnecting. Leaving the
+                # message unacked makes JetStream redeliver it once serial is
+                # healthy again, so nothing destined for the device is lost.
+                if not self._serial_connected or self.serial_writer is None:
+                    logger.warning("Serial port down; deferring write (will redeliver)")
+                    await msg.nak()
+                    return
                 try:
                     self.serial_writer.write(msg.data + b"\n")
                     await self.serial_writer.drain()
                     logger.debug(f"Wrote line ({len(msg.data)} bytes) to serial")
                     await msg.ack()
-                except Exception as e:
+                except (serial.SerialException, OSError) as e:
+                    # Connection just died; let the reader task reconnect and
+                    # let JetStream redeliver this message.
                     logger.error(f"Error writing to serial: {e}")
+                    await msg.nak()
 
             sub = await self.js.subscribe(
                 self.rx_subject,
@@ -169,11 +234,12 @@ class SerialJetStreamBridge:
     async def run(self) -> None:
         """Start the bridge: connect all components and run reader/writer tasks."""
         try:
+            self._running = True
+
             # Connect both serial and NATS
             await self.connect_serial()
             await self.connect_nats()
-            
-            self._running = True
+
             logger.info("Bridge started. Press Ctrl+C to stop.")
             
             # Run reader and writer concurrently
@@ -194,11 +260,11 @@ class SerialJetStreamBridge:
         """Clean shutdown: close serial and NATS connections."""
         self._running = False
         logger.info("Shutting down...")
-        
-        if self.serial_writer:
-            self.serial_writer.close()
-            await self.serial_writer.wait_closed()
-        
+
+        # _close_serial swallows the ClearCommError/in_waiting poll that a
+        # dead Windows transport raises during close.
+        await self._close_serial()
+
         if self.nc and self.nc.is_connected:
             await self.nc.close()
         
