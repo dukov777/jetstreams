@@ -94,6 +94,37 @@ Messages are line-buffered: each `\n`-terminated line becomes one NATS message.
 
 ---
 
+### `serial_listener.py` — Bridge listener
+
+Subscribes to the bridge's TX subject (`device.tx`) and dumps every message to the console. Pairs with `serial_jetstream_bridge.py` to watch what a device is sending.
+
+```bash
+uv run serial_listener.py                  # replay all, then follow live
+uv run serial_listener.py --new            # only messages from now on
+uv run serial_listener.py --raw            # payload only, no prefix
+uv run serial_listener.py --subject device.tx --nats nats://myserver:4222
+```
+
+Default output prefixes each message with a timestamp, stream sequence, and subject:
+
+```
+[11:47:02.136] seq=1 <device.tx> line-one
+```
+
+`--raw` prints just the payload. The listener uses an ephemeral push consumer, so each run is independent and leaves no durable state behind.
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--nats` | `nats://localhost:4222` | NATS server URL |
+| `--subject` | `device.tx` | Subject to listen on |
+| `--stream-name` | `serial-bridge` | JetStream stream name |
+| `--new` | (off) | Only show messages published from now on (default: replay all) |
+| `--raw` | (off) | Print only the payload, no timestamp/seq prefix |
+
+---
+
 ## Key concepts
 
 | Concept | Description |
