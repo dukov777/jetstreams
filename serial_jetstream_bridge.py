@@ -79,13 +79,13 @@ class SerialJetStreamBridge:
                 await self.js.add_stream(
                     name=self.stream_name,
                     subjects=[self.tx_subject, self.rx_subject],
-                    max_age=3600 * 1_000_000_000,  # 1 hour retention
+                    max_age=3600,  # 1 hour retention (seconds; nats-py converts to ns)
                     max_msgs=100_000,
                 )
                 logger.info(f"Created JetStream '{self.stream_name}' with subjects: {self.tx_subject}, {self.rx_subject}")
-            except nats.js.errors.BadRequest as e:
+            except nats.js.errors.BadRequestError as e:
                 # Stream already exists
-                if "stream already exists" in str(e):
+                if "stream already exists" in str(e) or "in use" in str(e):
                     logger.info(f"JetStream '{self.stream_name}' already exists")
                 else:
                     raise
