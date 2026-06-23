@@ -1,0 +1,10 @@
+[project]
+name = "jetstream-examples"
+version = "0.1.0"
+description = "NATS JetStream examples in Python — fanout, pull consumers, replay, stream inspection, and a serial-to-NATS bridge."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nats-py",
+    "pyserial-asyncio",
+]

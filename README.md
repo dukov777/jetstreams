@@ -5,7 +5,7 @@ NATS JetStream examples in Python — fanout, pull consumers, replay, stream ins
 ## Prerequisites
 
 - Docker
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (Python 3.10+ is provisioned automatically)
 
 ## Setup
 
@@ -15,19 +15,13 @@ NATS JetStream examples in Python — fanout, pull consumers, replay, stream ins
 docker run -d --name nats-js -p 4222:4222 nats:latest -js
 ```
 
-**2. Create a virtual environment and install dependencies:**
+**2. Install dependencies:**
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install nats-py
+uv sync
 ```
 
-For the serial bridge only, also install:
-
-```bash
-pip install pyserial-asyncio
-```
+This creates a `.venv` and installs all dependencies (`nats-py`, `pyserial-asyncio`) from `pyproject.toml`.
 
 ---
 
@@ -38,8 +32,7 @@ pip install pyserial-asyncio
 Shows 3 independent consumers each receiving all 10 messages, plus replay from a specific sequence.
 
 ```bash
-source venv/bin/activate
-python3 jetstream_fanout.py
+uv run jetstream_fanout.py
 ```
 
 **What it does:**
@@ -57,8 +50,7 @@ python3 jetstream_fanout.py
 Six self-contained examples that build up from basics to fanout and inspection.
 
 ```bash
-source venv/bin/activate
-python3 jetstream_examples.py
+uv run jetstream_examples.py
 ```
 
 | Example | What it shows |
@@ -82,10 +74,9 @@ serial port  ◄──  device.rx  (stream: serial-bridge)
 ```
 
 ```bash
-source venv/bin/activate
-python3 serial_jetstream_bridge.py /dev/ttyUSB0
-python3 serial_jetstream_bridge.py /dev/ttyUSB0 --baudrate 9600
-python3 serial_jetstream_bridge.py COM3 --nats nats://myserver:4222
+uv run serial_jetstream_bridge.py /dev/ttyUSB0
+uv run serial_jetstream_bridge.py /dev/ttyUSB0 --baudrate 9600
+uv run serial_jetstream_bridge.py COM3 --nats nats://myserver:4222
 ```
 
 **Options:**
