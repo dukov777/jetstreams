@@ -17,6 +17,7 @@ Usage:
 import asyncio
 import argparse
 import logging
+import os
 from datetime import datetime
 from typing import Optional, TextIO
 
@@ -59,19 +60,28 @@ async def listen(
     append: bool = False,
 ) -> None:
     """Connect to NATS and print every message on `subject` until interrupted."""
-    log_fp: Optional[TextIO] = None
+    log_fps: list[TextIO] = []
     if log_file:
+        # 1) The file exactly as passed (respects --append).
         mode = "a" if append else "w"
-        log_fp = open(log_file, mode, encoding="utf-8")
+        log_fps.append(open(log_file, mode, encoding="utf-8"))
         logger.info(
             f"Logging to '{log_file}' (mode={'append' if append else 'overwrite'})"
         )
 
+        # 2) A per-run, timestamped sibling in the same directory:
+        #    ./logs/logfile.log -> ./logs/20260624_105059-logfile.log
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        directory, name = os.path.split(log_file)
+        stamped_path = os.path.join(directory, f"{stamp}-{name}")
+        log_fps.append(open(stamped_path, "w", encoding="utf-8"))
+        logger.info(f"Logging this run to '{stamped_path}'")
+
     def emit(line: str) -> None:
         print(line, flush=True)
-        if log_fp is not None:
-            log_fp.write(line + "\n")
-            log_fp.flush()
+        for fp in log_fps:
+            fp.write(line + "\n")
+            fp.flush()
 
     nc = await nats.connect(nats_url)
     js = nc.jetstream()
@@ -110,8 +120,8 @@ async def listen(
     finally:
         await sub.unsubscribe()
         await nc.close()
-        if log_fp is not None:
-            log_fp.close()
+        for fp in log_fps:
+            fp.close()
         logger.info("Listener stopped")
 
 
