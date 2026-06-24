@@ -89,8 +89,14 @@ uv run serial_jetstream_bridge.py COM3 --nats nats://myserver:4222
 | `--tx-subject` | `device.tx` | Subject for serial → NATS |
 | `--rx-subject` | `device.rx` | Subject for NATS → serial |
 | `--stream-name` | `serial-bridge` | JetStream stream name |
+| `-v`, `--verbose` | (off) | Enable DEBUG logging — shows every byte read from / written to serial |
+| `--log-file` | (none) | Also write log output to this file (tees to console + file) |
 
 Messages are line-buffered: each `\n`-terminated line becomes one NATS message.
+
+**Byte-for-byte in both directions:** the reader publishes each `readline()` result **verbatim**, including its trailing terminator (`\n`, `\r\n`, or `\r`) and blank lines — the stream is an exact copy of the device output. The writer is the mirror: it writes RX payloads to the port **verbatim and appends nothing**, so the publisher owns the exact bytes (terminator included). See `serial_sender.py` below.
+
+> Run with `-v` to confirm traffic: you'll see `Published line (N bytes)…` and `Wrote N bytes to serial` for each message. The `repr` in the write log tells you whether a terminator is real: `b'#restart\r\n'` (single backslash) is a real CR LF, while `b'#restart\\r\\n'` (double backslash) is the literal text `\r\n`.
 
 **Stream retention:** the bridge creates the `serial-bridge` stream with `max_msgs=1_000_000` and **no time limit** — messages are kept until the stream reaches a million, then the oldest are evicted. Reading messages never removes them; only these limits do.
 
@@ -126,6 +132,8 @@ With `--fullformat`, each line is prefixed with the capture timestamp taken from
 
 The listener uses an ephemeral push consumer, so each run is independent and leaves no durable state behind.
 
+When `--log-file ./logs/out.log` is given, the listener writes to **two** files: the path as passed, plus a per-run timestamped sibling in the same directory (`./logs/20260624_105059-out.log`). Payloads are written through without an added newline and with newline translation disabled, so the file is a byte-for-byte copy of the device output.
+
 **Options:**
 
 | Flag | Default | Description |
@@ -135,8 +143,38 @@ The listener uses an ephemeral push consumer, so each run is independent and lea
 | `--stream-name` | `serial-bridge` | JetStream stream name |
 | `--all` | (off) | Replay all retained messages first (default: only new messages from now on) |
 | `--fullformat` | (off) | Prefix each line with the capture timestamp (default: raw payload only) |
-| `--log-file` | (none) | Also write every message to this file (tees to stdout + file) |
-| `--append` | (off) | Append to `--log-file` instead of overwriting it on start |
+| `--log-file` | (none) | Tee every message to this file **and** a timestamped per-run copy beside it |
+| `--append` | (off) | Append to the named `--log-file` instead of overwriting it on start (the timestamped copy is always fresh) |
+
+---
+
+### `serial_sender.py` — Bridge sender
+
+The opposite direction of `serial_listener.py`: publishes a single message to the bridge's RX subject (`device.rx`), which the bridge then writes out to the serial port. This is how you send a command *to* the device.
+
+```bash
+uv run serial_sender.py "#restart"                 # send literal text
+uv run serial_sender.py -e "#restart\r\n"          # interpret \r \n \t as real control bytes
+uv run serial_sender.py "hello" --subject device.rx
+uv run serial_sender.py "reboot" --nats nats://myserver:4222
+```
+
+The bridge writes RX payloads **verbatim and appends no terminator**, so you own the exact bytes. If the device needs a `\r\n` line ending, include it yourself with `-e`:
+
+- without `-e` → `"#restart\r\n"` sends the **literal 12-byte** text `#restart\r\n` (backslashes and letters)
+- with `-e` → `-e "#restart\r\n"` sends **10 bytes** ending in a real CR LF
+- your shell can also embed a real newline directly with `$'#restart\r\n'` (bash/zsh)
+
+It publishes once and exits. Because the bridge's RX consumer is durable, a message is retained and delivered even if the bridge isn't running yet — it gets written out once the bridge connects.
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `message` | (required) | The string to send (published to the RX subject) |
+| `--nats` | `nats://localhost:4222` | NATS server URL |
+| `--subject` | `device.rx` | Subject to publish on |
+| `-e`, `--interpret-escapes` | (off) | Interpret backslash escapes (`\n`, `\r`, `\t`, …) as real characters |
 
 ---
 
