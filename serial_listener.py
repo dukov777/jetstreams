@@ -63,8 +63,11 @@ async def listen(
     log_fps: list[TextIO] = []
     if log_file:
         # 1) The file exactly as passed (respects --append).
+        # newline="" disables newline translation so the original terminator
+        # (\n, \r\n, or \r) is written through verbatim — the log stays a
+        # byte-for-byte copy of what the device emitted.
         mode = "a" if append else "w"
-        log_fps.append(open(log_file, mode, encoding="utf-8"))
+        log_fps.append(open(log_file, mode, encoding="utf-8", newline=""))
         logger.info(
             f"Logging to '{log_file}' (mode={'append' if append else 'overwrite'})"
         )
@@ -74,13 +77,14 @@ async def listen(
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         directory, name = os.path.split(log_file)
         stamped_path = os.path.join(directory, f"{stamp}-{name}")
-        log_fps.append(open(stamped_path, "w", encoding="utf-8"))
+        log_fps.append(open(stamped_path, "w", encoding="utf-8", newline=""))
         logger.info(f"Logging this run to '{stamped_path}'")
 
     def emit(line: str) -> None:
-        print(line, flush=True)
+        # The payload already carries its own line terminator, so don't add one.
+        print(line, end="", flush=True)
         for fp in log_fps:
-            fp.write(line + "\n")
+            fp.write(line)
             fp.flush()
 
     nc = await nats.connect(nats_url)

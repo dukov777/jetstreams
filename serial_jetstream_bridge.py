@@ -148,8 +148,8 @@ class SerialJetStreamBridge:
 
         Line-buffered, not chunk-buffered: a line may arrive across multiple
         underlying reads, but is only published once a full '\\n' is seen.
-        This matches NDJSON / line-oriented UART protocols where each
-        message is exactly one line.
+        The trailing terminator is preserved (not stripped) so the published
+        bytes are an exact copy of what the device sent.
         """
         logger.info(f"Starting serial reader (publishing to '{self.tx_subject}')")
         try:
@@ -173,17 +173,16 @@ class SerialJetStreamBridge:
 
                 if not line:
                     # EOF on serial (port closed/unplugged) — treat as a
-                    # dropped connection and try to bring it back.
+                    # dropped connection and try to bring it back. readline()
+                    # only returns empty on EOF; a blank line is b"\n" (truthy).
                     logger.warning("Serial reader got EOF; reconnecting")
                     await self._reconnect_serial()
                     continue
 
-                # readline() includes the trailing '\n' (if present);
-                # strip it before publishing, the wire framing is NATS messages now.
-                line = line.rstrip(b"\n").rstrip(b"\r")
-                if not line:
-                    continue  # skip blank lines
-
+                # Publish the line exactly as read, INCLUDING its trailing
+                # terminator (\n, \r\n, or \r). Nothing is stripped and blank
+                # lines are kept, so the stream — and any listener log — is a
+                # byte-for-byte record of what the device emitted.
                 ack = await self.js.publish(
                     self.tx_subject,
                     line,
