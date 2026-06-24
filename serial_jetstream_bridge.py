@@ -24,11 +24,22 @@ import nats
 from nats.errors import TimeoutError as NatsTimeoutError
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+
+def configure_logging(verbose: bool, log_file: Optional[str]) -> None:
+    """Set the log level and optionally tee logs to a file."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    if log_file:
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(handler)
+        logger.info(f"Also logging to '{log_file}'")
 
 
 class SerialJetStreamBridge:
@@ -309,9 +320,22 @@ async def main():
         default="serial-bridge",
         help="JetStream name (default: serial-bridge)"
     )
-    
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable DEBUG logging (shows every byte read from / written to serial)"
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Also write log output to this file (default: console only)"
+    )
+
     args = parser.parse_args()
-    
+
+    configure_logging(verbose=args.verbose, log_file=args.log_file)
+
     bridge = SerialJetStreamBridge(
         port=args.port,
         baudrate=args.baudrate,
