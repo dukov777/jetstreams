@@ -127,9 +127,14 @@ async def listen(
     def emit_line(line_bytes: bytes, ts: str) -> None:
         text = line_bytes.decode(errors="replace")
         if raw:
+            # Byte-for-byte: emit exactly as received, terminator included.
             emit(text)
         else:
-            emit(f"[{ts}] {text}")
+            # Human-readable: one timestamped line per record. Strip the
+            # device terminator (which may be a bare \r that wouldn't advance
+            # the line) and end with a real \n so each timestamp is on its own
+            # line on the console and in the log.
+            emit(f"[{ts}] {text.rstrip(chr(13) + chr(10))}\n")
 
     nc = await nats.connect(nats_url)
     js = nc.jetstream()
