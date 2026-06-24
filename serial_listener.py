@@ -17,7 +17,7 @@ Usage:
 import asyncio
 import argparse
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, TextIO
 
 import nats
@@ -40,12 +40,13 @@ def _format_capture_time(msg) -> str:
     header_ts = msg.headers.get("Ts") if msg.headers else None
     if header_ts is not None:
         try:
-            dt = datetime.fromtimestamp(float(header_ts), timezone.utc)
+            # fromtimestamp() with no tz returns local time.
+            dt = datetime.fromtimestamp(float(header_ts))
             return dt.strftime("%H:%M:%S.%f")[:-3]
         except (ValueError, OverflowError):
             pass
-    # Fallback: server-side store time stamped by JetStream.
-    return msg.metadata.timestamp.strftime("%H:%M:%S.%f")[:-3]
+    # Fallback: server-side store time stamped by JetStream (UTC) -> local.
+    return msg.metadata.timestamp.astimezone().strftime("%H:%M:%S.%f")[:-3]
 
 
 async def listen(
@@ -88,7 +89,6 @@ async def listen(
             # Dump the raw payload only; ignore the timestamp header.
             emit(text)
         else:
-            seq = msg.metadata.sequence.stream
             ts = _format_capture_time(msg)
             emit(f"[{ts}] {text}")
         await msg.ack()
