@@ -30,6 +30,7 @@ async def main():
 
     # Publish 10 messages
     print("📤 Publishing 10 messages to 'logs' stream:")
+    published_seqs = []
     for i in range(1, 11):
         msg_data = {
             "id": i,
@@ -39,6 +40,7 @@ async def main():
         }
         subject = f"logs.application"
         ack = await js.publish(subject, json.dumps(msg_data).encode())
+        published_seqs.append(ack.seq)
         print(f"  [{i}] Published to {subject} (seq: {ack.seq})")
 
     print()
@@ -137,15 +139,19 @@ async def main():
     except:
         pass
 
+    # Replay from the 6th published message. Stream sequence numbers are
+    # monotonic and survive purges, so we use the actual sequence captured
+    # at publish time rather than a hardcoded value.
+    replay_seq = published_seqs[5]
     await js.add_consumer(
         stream_name,
         durable_name=replay_durable,
         deliver_policy="by_start_sequence",
-        opt_start_seq=6  # Start from message at position 6
+        opt_start_seq=replay_seq  # Start from the 6th message
     )
-    print(f"✓ Created replay consumer starting from sequence 6\n")
+    print(f"✓ Created replay consumer starting from sequence {replay_seq}\n")
 
-    print("  Replaying from sequence 6:")
+    print(f"  Replaying from sequence {replay_seq}:")
     psub = await js.pull_subscribe(
         f"{stream_name}.>",
         durable=replay_durable

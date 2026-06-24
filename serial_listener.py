@@ -31,6 +31,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _format_capture_time(msg) -> str:
+    """
+    Prefer the bridge's capture time from the 'Ts' header (epoch seconds, set
+    when the serial line was read). Fall back to JetStream's store time if the
+    header is missing (e.g. messages published before headers were added).
+    """
+    header_ts = msg.headers.get("Ts") if msg.headers else None
+    if header_ts is not None:
+        try:
+            dt = datetime.fromtimestamp(float(header_ts), timezone.utc)
+            return dt.strftime("%H:%M:%S.%f")[:-3]
+        except (ValueError, OverflowError):
+            pass
+    # Fallback: server-side store time stamped by JetStream.
+    return msg.metadata.timestamp.strftime("%H:%M:%S.%f")[:-3]
+
+
 async def listen(
     nats_url: str,
     subject: str,
@@ -68,11 +85,12 @@ async def listen(
     async def on_message(msg):
         text = msg.data.decode(errors="replace")
         if raw:
+            # Dump the raw payload only; ignore the timestamp header.
             emit(text)
         else:
             seq = msg.metadata.sequence.stream
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-            emit(f"[{ts}] seq={seq} <{msg.subject}> {text}")
+            ts = _format_capture_time(msg)
+            emit(f"[{ts}] {text}")
         await msg.ack()
 
     # Ephemeral push consumer: server delivers messages straight to the callback.

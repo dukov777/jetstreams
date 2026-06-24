@@ -14,6 +14,7 @@ Usage:
 import asyncio
 import argparse
 import sys
+import time
 import logging
 from typing import Optional
 
@@ -126,8 +127,8 @@ class SerialJetStreamBridge:
                 await self.js.add_stream(
                     name=self.stream_name,
                     subjects=[self.tx_subject, self.rx_subject],
-                    max_age=3600,  # 1 hour retention (seconds; nats-py converts to ns)
-                    max_msgs=100_000,
+                    max_msgs=1_000_000,  # cap by count; oldest evicted past this
+                    # no max_age -> 0 means messages never expire by time
                 )
                 logger.info(f"Created JetStream '{self.stream_name}' with subjects: {self.tx_subject}, {self.rx_subject}")
             except nats.js.errors.BadRequestError as e:
@@ -183,7 +184,11 @@ class SerialJetStreamBridge:
                 if not line:
                     continue  # skip blank lines
 
-                ack = await self.js.publish(self.tx_subject, line)
+                ack = await self.js.publish(
+                    self.tx_subject,
+                    line,
+                    headers={"Ts": str(time.time())},  # capture time, body stays raw
+                )
                 logger.debug(f"Published line ({len(line)} bytes) to {self.tx_subject} (seq: {ack.seq})")
         except asyncio.CancelledError:
             logger.info("Serial reader task cancelled")
