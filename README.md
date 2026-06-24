@@ -66,7 +66,7 @@ uv run jetstream_examples.py
 
 ### `serial_jetstream_bridge.py` — Serial ↔ NATS bridge
 
-Bidirectional bridge: reads lines from a serial port and publishes them to NATS JetStream, while simultaneously writing inbound NATS messages back to the serial port.
+Bidirectional bridge: reads raw byte chunks from a serial port and publishes them to NATS JetStream, while simultaneously writing inbound NATS messages back to the serial port. It does **no** line framing — that is the listener's job (see below).
 
 ```
 serial port  ──►  device.tx  (stream: serial-bridge)
@@ -92,11 +92,11 @@ uv run serial_jetstream_bridge.py COM3 --nats nats://myserver:4222
 | `-v`, `--verbose` | (off) | Enable DEBUG logging — shows every byte read from / written to serial |
 | `--log-file` | (none) | Also write log output to this file (tees to console + file) |
 
-Messages are line-buffered: each `\n`-terminated line becomes one NATS message.
+**Chunk forwarding (not line-framed):** serial data does not always arrive on line boundaries, so the reader reads **up to 100 bytes with a 0.1s poll** (`read(100)`) and publishes whatever is available — 1 byte, 100 bytes, whatever the port has — as one NATS message. `read()` returns as soon as *any* bytes are present and only blocks when the buffer is empty, so the 0.1s timeout is a heartbeat (to stay responsive to shutdown), not a data deadline; no bytes are ever dropped. A single device line can therefore land in the stream split across several messages — reassembling it back into lines is `serial_listener.py`'s job.
 
-**Byte-for-byte in both directions:** the reader publishes each `readline()` result **verbatim**, including its trailing terminator (`\n`, `\r\n`, or `\r`) and blank lines — the stream is an exact copy of the device output. The writer is the mirror: it writes RX payloads to the port **verbatim and appends nothing**, so the publisher owns the exact bytes (terminator included). See `serial_sender.py` below.
+**Byte-for-byte in both directions:** the reader publishes each chunk **verbatim** (no framing, no stripping) — the stream is an exact copy of the device output. The writer is the mirror: it writes RX payloads to the port **verbatim and appends nothing**, so the publisher owns the exact bytes (terminator included). See `serial_sender.py` below.
 
-> Run with `-v` to confirm traffic: you'll see `Published line (N bytes)…` and `Wrote N bytes to serial` for each message. The `repr` in the write log tells you whether a terminator is real: `b'#restart\r\n'` (single backslash) is a real CR LF, while `b'#restart\\r\\n'` (double backslash) is the literal text `\r\n`.
+> Run with `-v` to confirm traffic: you'll see `Published chunk (N bytes)…` and `Wrote N bytes to serial` for each message. The `repr` in the write log tells you whether a terminator is real: `b'#restart\r\n'` (single backslash) is a real CR LF, while `b'#restart\\r\\n'` (double backslash) is the literal text `\r\n`.
 
 **Stream retention:** the bridge creates the `serial-bridge` stream with `max_msgs=1_000_000` and **no time limit** — messages are kept until the stream reaches a million, then the oldest are evicted. Reading messages never removes them; only these limits do.
 
@@ -105,18 +105,18 @@ Messages are line-buffered: each `\n`-terminated line becomes one NATS message.
 > nats stream edit serial-bridge --max-msgs=1000000 --max-age=0
 > ```
 
-**Per-message timestamp:** each published message carries a `Ts` NATS header holding the bridge's capture time (epoch seconds, `time.time()`). The payload body stays the raw line — consumers that only care about the data can ignore the header, while `serial_listener.py` uses it to show when a line was read.
+**Per-message timestamp:** each published chunk carries a `Ts` NATS header holding the bridge's capture time (epoch seconds, `time.time()`). The payload body stays the raw bytes — consumers that only care about the data can ignore the header, while `serial_listener.py` uses it to timestamp each reassembled line (the chunk that carried the line's terminator wins).
 
 ---
 
 ### `serial_listener.py` — Bridge listener
 
-Subscribes to the bridge's TX subject (`device.tx`) and dumps every message to the console. Pairs with `serial_jetstream_bridge.py` to watch what a device is sending.
+Subscribes to the bridge's TX subject (`device.tx`) and reassembles the raw chunks back into lines. Pairs with `serial_jetstream_bridge.py` to watch what a device is sending.
 
 ```bash
 uv run serial_listener.py                       # follow live (raw payload only)
 uv run serial_listener.py --all                 # replay everything in the stream first
-uv run serial_listener.py --fullformat          # prefix each line with a timestamp
+uv run serial_listener.py --fullformat          # one timestamped line per record
 uv run serial_listener.py --log-file out.log    # also tee to a file (overwrite)
 uv run serial_listener.py --log-file out.log --append   # tee, appending
 uv run serial_listener.py --subject device.tx --nats nats://myserver:4222
@@ -124,11 +124,20 @@ uv run serial_listener.py --subject device.tx --nats nats://myserver:4222
 
 By default the listener prints **only the raw payload** and starts from now (it drops the existing backlog). Pass `--all` to replay everything still retained in the stream first, then follow live.
 
-With `--fullformat`, each line is prefixed with the capture timestamp taken from the message's `Ts` header (falling back to JetStream's store time for older messages without the header):
+**Line reassembly:** because the bridge forwards raw chunks (a line may be split across several messages, or several lines may share one message), the listener buffers incoming bytes and emits a line when it sees a terminator. The rules:
+
+- A line is complete on `\n`, `\r`, or `\r\n` (the terminator stays attached). A bare `\r` counts — some devices end lines with just a carriage return.
+- Each completed line is tagged with the capture timestamp of the **chunk that carried the terminating newline** (taken from that message's `Ts` header, falling back to JetStream's store time).
+- A partial line that sits with **no terminator for 2 seconds** is flushed anyway (with the latest chunk's timestamp) and the buffer cleared, so unterminated output is still shown instead of waiting forever. The bytes are emitted once — not duplicated when the rest of the line later arrives.
+
+With `--fullformat`, each record is printed as one clean line — the device terminator is stripped and replaced with a real `\n`, so a bare-`\r` device (whose lines would otherwise overwrite each other on the terminal) still shows one timestamped line per record:
 
 ```
-[11:47:02.136] line-one
+[12:04:13.363] 860693080371397
+[12:04:16.988] 860693080371397
 ```
+
+In the default (raw) mode the payload is emitted **verbatim**, terminator included, for a byte-for-byte capture.
 
 The listener uses an ephemeral push consumer, so each run is independent and leaves no durable state behind.
 
