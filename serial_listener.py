@@ -36,6 +36,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _split_lines(buf: bytes):
+    """
+    Split a byte buffer into complete lines plus a trailing remainder.
+
+    A line is terminated by '\\n', '\\r', or '\\r\\n' (the terminator stays
+    attached to the line). Some devices end lines with a bare '\\r', so '\\r'
+    alone counts. Returns (list_of_complete_lines, remainder_without_terminator).
+    """
+    lines = []
+    start = 0
+    i = 0
+    n = len(buf)
+    while i < n:
+        c = buf[i]
+        if c == 0x0A:  # \n
+            lines.append(buf[start:i + 1])
+            start = i + 1
+            i += 1
+        elif c == 0x0D:  # \r — consume a following \n so \r\n is one line
+            if i + 1 < n and buf[i + 1] == 0x0A:
+                lines.append(buf[start:i + 2])
+                start = i + 2
+                i += 2
+            else:
+                lines.append(buf[start:i + 1])
+                start = i + 1
+                i += 1
+        else:
+            i += 1
+    return lines, buf[start:]
+
+
 def _format_capture_time(msg) -> str:
     """
     Prefer the bridge's capture time from the 'Ts' header (epoch seconds, set
@@ -124,16 +156,12 @@ async def listen(
         state["last"] = loop.time()
 
         # Drain every complete line currently in the buffer; each uses this
-        # message's timestamp (the buffer held no '\n' before this chunk).
-        buf = state["buf"]
-        start = 0
-        nl = buf.find(b"\n")
-        while nl != -1:
-            emit_line(buf[start:nl + 1], ts)
-            start = nl + 1
-            nl = buf.find(b"\n", start)
+        # message's timestamp (the buffer held no terminator before this chunk).
+        lines, remainder = _split_lines(state["buf"])
+        for line in lines:
+            emit_line(line, ts)
 
-        state["buf"] = buf[start:]  # remainder is a partial line (no '\n')
+        state["buf"] = remainder    # partial line (no terminator yet)
         if not state["buf"]:
             state["ts"] = None
             state["last"] = None
