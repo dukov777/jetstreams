@@ -3,13 +3,17 @@
 Serial Bridge Listener
 
 Subscribes to the TX subject published by serial_jetstream_bridge.py
-(serial → NATS) and dumps every message to the console.
+(serial → NATS). The bridge forwards raw serial chunks that may not align to
+line boundaries, so this listener reassembles them into lines: a line is
+complete on '\\n' ('\\r\\n' kept attached) and is tagged with the capture
+timestamp of the chunk that carried the newline. A partial line with no
+terminator is flushed after 2s so unterminated output is still shown.
 
 Usage:
     python serial_listener.py
     python serial_listener.py --subject device.tx --nats nats://localhost:4222
-    python serial_listener.py --all          # replay everything already in the stream
-    python serial_listener.py --raw           # no timestamp/seq prefix
+    python serial_listener.py --all           # replay everything already in the stream
+    python serial_listener.py --fullformat    # prefix each line with its timestamp
     python serial_listener.py --log-file out.log          # tee to file (overwrite)
     python serial_listener.py --log-file out.log --append # tee to file (append)
 """
@@ -81,14 +85,23 @@ async def listen(
         logger.info(f"Logging this run to '{stamped_path}'")
 
     def emit(line: str) -> None:
-        # The payload already carries its own line terminator, so don't add one.
+        # `line` already carries its own terminator (or none, for a flush),
+        # so don't add one — keeps the log a byte-for-byte copy.
         print(line, end="", flush=True)
         for fp in log_fps:
             fp.write(line)
             fp.flush()
 
+    def emit_line(line_bytes: bytes, ts: str) -> None:
+        text = line_bytes.decode(errors="replace")
+        if raw:
+            emit(text)
+        else:
+            emit(f"[{ts}] {text}")
+
     nc = await nats.connect(nats_url)
     js = nc.jetstream()
+    loop = asyncio.get_event_loop()
     logger.info(f"Connected to NATS at {nats_url}")
 
     deliver_policy = DeliverPolicy.ALL if replay_all else DeliverPolicy.NEW
@@ -97,14 +110,33 @@ async def listen(
         f"deliver_policy={deliver_policy.value})"
     )
 
+    # The bridge now publishes raw serial chunks that do not respect line
+    # boundaries, so this listener reassembles lines. A line is complete when
+    # a '\n' is seen ('\r\n' stays attached); it is tagged with the capture
+    # timestamp of the chunk that carried that newline.
+    FLUSH_TIMEOUT = 2.0  # seconds; dump a partial line if no newline arrives
+    state = {"buf": b"", "ts": None, "last": None}
+
     async def on_message(msg):
-        text = msg.data.decode(errors="replace")
-        if raw:
-            # Dump the raw payload only; ignore the timestamp header.
-            emit(text)
-        else:
-            ts = _format_capture_time(msg)
-            emit(f"[{ts}] {text}")
+        ts = _format_capture_time(msg)
+        state["buf"] += msg.data
+        state["ts"] = ts            # newline-bearing / latest chunk wins
+        state["last"] = loop.time()
+
+        # Drain every complete line currently in the buffer; each uses this
+        # message's timestamp (the buffer held no '\n' before this chunk).
+        buf = state["buf"]
+        start = 0
+        nl = buf.find(b"\n")
+        while nl != -1:
+            emit_line(buf[start:nl + 1], ts)
+            start = nl + 1
+            nl = buf.find(b"\n", start)
+
+        state["buf"] = buf[start:]  # remainder is a partial line (no '\n')
+        if not state["buf"]:
+            state["ts"] = None
+            state["last"] = None
         await msg.ack()
 
     # Ephemeral push consumer: server delivers messages straight to the callback.
@@ -116,9 +148,17 @@ async def listen(
     )
 
     try:
-        # Idle here while the callback handles messages.
+        # Idle loop also flushes a partial line that has sat without a
+        # terminator for longer than FLUSH_TIMEOUT, so unterminated output is
+        # still shown (with its timestamp) instead of waiting forever.
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
+            if state["buf"] and state["last"] is not None:
+                if loop.time() - state["last"] > FLUSH_TIMEOUT:
+                    emit_line(state["buf"], state["ts"])
+                    state["buf"] = b""
+                    state["ts"] = None
+                    state["last"] = None
     except asyncio.CancelledError:
         pass
     finally:

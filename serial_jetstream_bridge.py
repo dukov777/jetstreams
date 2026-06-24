@@ -154,26 +154,31 @@ class SerialJetStreamBridge:
     
     async def serial_reader_task(self) -> None:
         """
-        Continuously read one line at a time from serial port and publish
-        each line as a separate NATS message on the TX subject.
+        Continuously read raw byte chunks from the serial port and publish each
+        chunk as a NATS message on the TX subject.
 
-        Line-buffered, not chunk-buffered: a line may arrive across multiple
-        underlying reads, but is only published once a full '\\n' is seen.
-        The trailing terminator is preserved (not stripped) so the published
-        bytes are an exact copy of what the device sent.
+        NOT line-framed: the device data does not always arrive on line
+        boundaries, so this reads up to READ_CHUNK_SIZE bytes with a short poll
+        timeout and forwards whatever is available, untouched. Line terminators
+        are out of scope here — reassembling chunks back into lines is the
+        listener's job. Each message still carries a 'Ts' capture-time header.
         """
+        READ_CHUNK_SIZE = 100
+        READ_TIMEOUT = 0.1
+
         logger.info(f"Starting serial reader (publishing to '{self.tx_subject}')")
         try:
             while self._running:
                 try:
-                    # readline() blocks (internally) until '\n' or EOF;
-                    # wrap in wait_for so we can still respond to shutdown.
-                    line = await asyncio.wait_for(
-                        self.serial_reader.readline(),
-                        timeout=1.0
+                    # read() returns as soon as any bytes are available (up to
+                    # READ_CHUNK_SIZE); wait_for bounds the wait so we stay
+                    # responsive to shutdown when the port is idle.
+                    chunk = await asyncio.wait_for(
+                        self.serial_reader.read(READ_CHUNK_SIZE),
+                        timeout=READ_TIMEOUT
                     )
                 except asyncio.TimeoutError:
-                    # No complete line yet, just continue
+                    # No data this interval, just poll again.
                     continue
                 except (serial.SerialException, OSError) as e:
                     # Device unplugged/reset (e.g. Windows ClearCommError).
@@ -182,24 +187,22 @@ class SerialJetStreamBridge:
                     await self._reconnect_serial()
                     continue
 
-                if not line:
+                if not chunk:
                     # EOF on serial (port closed/unplugged) — treat as a
-                    # dropped connection and try to bring it back. readline()
-                    # only returns empty on EOF; a blank line is b"\n" (truthy).
+                    # dropped connection and try to bring it back. read() only
+                    # returns empty on EOF, never on a normal idle interval.
                     logger.warning("Serial reader got EOF; reconnecting")
                     await self._reconnect_serial()
                     continue
 
-                # Publish the line exactly as read, INCLUDING its trailing
-                # terminator (\n, \r\n, or \r). Nothing is stripped and blank
-                # lines are kept, so the stream — and any listener log — is a
-                # byte-for-byte record of what the device emitted.
+                # Publish the chunk exactly as read — no framing, no stripping —
+                # so the stream is a byte-for-byte record of the device output.
                 ack = await self.js.publish(
                     self.tx_subject,
-                    line,
+                    chunk,
                     headers={"Ts": str(time.time())},  # capture time, body stays raw
                 )
-                logger.debug(f"Published line ({len(line)} bytes) to {self.tx_subject} (seq: {ack.seq})")
+                logger.debug(f"Published chunk ({len(chunk)} bytes) to {self.tx_subject} (seq: {ack.seq})")
         except asyncio.CancelledError:
             logger.info("Serial reader task cancelled")
         except Exception as e:
