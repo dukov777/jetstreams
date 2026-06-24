@@ -197,8 +197,9 @@ class SerialJetStreamBridge:
     async def serial_writer_task(self) -> None:
         """
         Subscribe to NATS RX subject and write each message to the serial
-        port as one line, terminated with '\\n' (matching what the reader
-        strips on the TX side).
+        port verbatim. The bridge does NOT append a line terminator — the
+        publisher owns the exact bytes (including any '\\r'/'\\n'), so what
+        reaches the device is byte-for-byte what was published.
         """
         logger.info(f"Starting serial writer (subscribing to '{self.rx_subject}')")
         try:
@@ -211,9 +212,11 @@ class SerialJetStreamBridge:
                     await msg.nak()
                     return
                 try:
-                    self.serial_writer.write(msg.data + b"\n")
+                    # Write the payload verbatim; the publisher owns the
+                    # terminator, so the device gets exactly what was sent.
+                    self.serial_writer.write(msg.data)
                     await self.serial_writer.drain()
-                    logger.debug(f"Wrote line ({len(msg.data)} bytes) to serial")
+                    logger.debug(f"Wrote {len(msg.data)} bytes to serial")
                     await msg.ack()
                 except (serial.SerialException, OSError) as e:
                     # Connection just died; let the reader task reconnect and
